@@ -10,7 +10,7 @@ namespace Compressor
     {
         static void Main(string[] args)
         {
-            switch (args[0])
+            /*switch (args[0])
             {
                 case "compress":
                     Compressor.Compress(args[1], args[2]);
@@ -21,7 +21,9 @@ namespace Compressor
                 default:
                     Console.WriteLine("incorrect command");
                     break;
-            }
+            }*/
+            //это пока для простоты
+            Compressor.Compress("source.jpg", "out");
         }
     }
 }
