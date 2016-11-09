@@ -1,0 +1,2 @@
+D:\Projects\Compressor\Compressor\bin\Debug\Compressor.exe.config
+D:\Projects\Compressor\Compressor\obj\Debug\Compressor.csprojResolveAssemblyReference.cache
