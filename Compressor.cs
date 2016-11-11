@@ -9,7 +9,7 @@ using System.IO.Compression;
 
 namespace Compressor
 {
-    public struct Task 
+    public class Task 
     {
         public byte[] buffer;
         public int numberOfPart;
@@ -32,7 +32,8 @@ namespace Compressor
         static ManualResetEvent newDoneTaskAdded;
 
         //true - закончили считывать данные из файла
-        static bool endOfFile;
+        static bool endOfFile; //метод Compress выставляет в true когда заканчивает читать файл
+        static object endOfFileLock = new object();
 
         static Compressor()
         {
@@ -49,22 +50,26 @@ namespace Compressor
         static void calculateSize()
         {
             //???? 
-            maxTasksCount = 1;
-            partSize = Environment.SystemPageSize/(maxTasksCount*2); 
+            maxTasksCount = 4;
+            partSize = 1000; //Environment.SystemPageSize/(maxTasksCount*2); 
         }
 
         public static void Compress(string source, string destination)
         {
+            Thread writeThread;
             //проверки наличия файла?
             using (FileStream sourceFile = new FileStream(source, FileMode.Open))
             {
                 //содздаем и запускаем потоки для сжатия
                 for (int i = 0; i < maxTasksCount; i++)
+                {
                     threadPull[i] = new Thread(consumerProcess);
+                    threadPull[i].Name = "ConsumerProcess" + i;
+                }
                 foreach (Thread tr in threadPull)
                     tr.Start();
 
-                Thread writeThread = new Thread(new ParameterizedThreadStart(writeProcess));
+                writeThread = new Thread(new ParameterizedThreadStart(writeProcess));
                 writeThread.Start(destination);
 
                 //читаем входной файл, генерируем задания и помещаем их в очередь
@@ -87,48 +92,75 @@ namespace Compressor
                         newTaskAdded.Set();
                     }
                 }
-                endOfFile = true;
+                lock (endOfFileLock)
+                {
+                    endOfFile = true;
+                }
+                newTaskAdded.Set();// =( эт на случай если рабочийПоток успел войти в ожидание после того, как проверил endOfFile, но до того, как здесь его изменили
             }
             foreach (var t in threadPull)
                 t.Join();
+            if(writeThread!=null)
+                writeThread.Join();
         }
 
         static void consumerProcess()
         {
-            while (!endOfFile)
+            while (true)
             {
-                Task task;
-                // если очередь заданий пуста, ждем события добавления нового задания
+                //проверяем, не пора ли заканчивать этот разврат
+                //проверяем переменную конца  в локе
+                bool end = false;
+                lock (endOfFileLock)
+                {
+                    end = endOfFile; //эту конструкция наверн можно заменить с интерлок
+                }
+                bool needwait = false;
                 lock (allTasksLock)
                 {
+                    //если заданий нет, но чтение еще не завершено, то ждем. иначе заканчиваем
                     if (allTasks.Count == 0)
+                        if (!end)
+                            needwait = true;
+                        else
+                            return;
+                }
+                if (needwait)
+                {          
+                    // ждем события добавления нового задания
+                    newTaskAdded.WaitOne();
+                    newTaskAdded.Reset();
+                }
+
+                Task task = null;
+                lock (allTasksLock)
+                {
+                    if (allTasks.Count > 0) // опять коряво и вторая проверка.....
                     {
-                        Monitor.Pulse(allTasksLock);
-                        Monitor.Wait(allTasksLock);
-                        newTaskAdded.WaitOne();
-                        newTaskAdded.Reset();
+                        task = allTasks.Dequeue();
+                        needNewTask.Set();
+                    }
+                }
+
+                if (task != null)
+                {
+                    Task doneTask = new Task();
+                    doneTask.numberOfPart = task.numberOfPart;
+                    using (MemoryStream output = new MemoryStream(partSize))
+                    {
+                        using (GZipStream gzip = new GZipStream(output, CompressionMode.Compress))
+                        {
+                            gzip.Write(task.buffer, 0, partSize);
+                        }
+                        doneTask.buffer = output.ToArray();
                     }
 
-                    task = allTasks.Dequeue();
-                    needNewTask.Set();
-                }
-                Task doneTask = new Task();
-                doneTask.numberOfPart = task.numberOfPart;
-                using (MemoryStream output = new MemoryStream(partSize))
-                {
-                    using (GZipStream gzip = new GZipStream(output, CompressionMode.Compress))
+                    lock (doneTasksLock)
                     {
-                        gzip.Write(task.buffer, 0, partSize);
+                        doneTasks.Add(doneTask);
+                        newDoneTaskAdded.Set();
                     }
-                    doneTask.buffer = output.ToArray();
                 }
-
-                lock (doneTasksLock)
-                {
-                    doneTasks.Add(doneTask);
-                    newDoneTaskAdded.Set();
-                }
-
             }
 
         }
@@ -143,22 +175,46 @@ namespace Compressor
                 Task task;
                 int currPartNumb = 0;
 
-                while (!endOfFile) //еще надо проверять, работают ли еще потоки по сжатию
+                while ((!endOfFile) || (doneTasks.Count>0) || (isAnyThreadAlive())) 
                 {
-                    //если очередь пуста, или в ней нет текущей на запись части, ждем
-                    if ((doneTasks.Count == 0)||(!doneTasks.Any(p=>p.numberOfPart==currPartNumb)))
-                        newDoneTaskAdded.WaitOne();
- 
-                    lock (doneTasks)
+                    bool needWait = false;
+                    lock (doneTasksLock)
                     {
-                        task = doneTasks.Find(p=>p.numberOfPart==currPartNumb);
+                        //если очередь пуста, или в ней нет текущей на запись части, ждем
+                        if ((doneTasks.Count == 0) || (!doneTasks.Any(p => p.numberOfPart == currPartNumb)))
+                        {
+                            if (!isAnyThreadAlive()) /// коряво вторая проверка.....
+                                needWait = true;
+                            //else return;
+                        }
+                    }
+                    if(needWait)
+                        newDoneTaskAdded.WaitOne();;
+ 
+                    lock (doneTasksLock)
+                    {
+                        task = doneTasks.Find(p=>(p!=null) && (p.numberOfPart==currPartNumb));
                         doneTasks.Remove(task);
                         newDoneTaskAdded.Reset();
                     }
-                    resFile.Write(task.buffer, 0, task.buffer.Length);
-                    currPartNumb++;
+                    if (task != null)
+                    {
+                        resFile.Write(task.buffer, 0, task.buffer.Length);
+                        currPartNumb++;
+                    }
                 }
             }
+        }
+        static bool isAnyThreadAlive()
+        {
+            bool res = false;
+            foreach (var t in threadPull)
+            {
+                if (t.IsAlive)
+                    res = true;
+                break;
+            }
+            return res;
         }
 
         public static void Decompress(string source, string destination)
