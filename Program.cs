@@ -23,7 +23,7 @@ namespace Compressor
                     break;
             }*/
             //это пока для простоты
-            Compressor.Compress("source.jpg", "out");
+            Compressor.Compress("source.mp4", "out");
         }
     }
 }

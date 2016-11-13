@@ -6,6 +6,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.IO;
 using System.IO.Compression;
+using Microsoft;
 
 namespace Compressor
 {
@@ -18,13 +19,15 @@ namespace Compressor
     public static class Compressor
     {
         static Thread[] threadPull;
+        static int partSize;
+        static int maxTasksCount;
 
         static Queue<Task> allTasks; //или использовать потокобезопасную  ConcurrentQueue ?... 
         static object allTasksLock = new object();
-        static int partSize;
-        static int maxTasksCount;
         static ManualResetEvent newTaskAdded; //если реализовывать специальную очередь, то событие будет в ее полномочиях
-        static ManualResetEvent needNewTask;
+        static int newTaskAddedCounter=0;
+        static object newTaskAddedCounterLocker= new object();
+        static AutoResetEvent needNewTask;
 
         //или другая логика записи?
         static List<Task> doneTasks; //или использовать потокобезопасную  ConcurrentQueue ?... 
@@ -43,15 +46,17 @@ namespace Compressor
             doneTasks = new List<Task>();
             threadPull = new Thread[maxTasksCount];
             newTaskAdded = new ManualResetEvent(false);
-            needNewTask = new ManualResetEvent(false);
+            needNewTask = new AutoResetEvent(false);
             newDoneTaskAdded = new ManualResetEvent(false);
         }
 
         static void calculateSize()
         {
             //???? 
-            maxTasksCount = 4;
-            partSize = 1000; //Environment.SystemPageSize/(maxTasksCount*2); 
+            maxTasksCount = Environment.ProcessorCount;
+            //ulong memory = Microsoft.VisualBasic.Devices.ComputerInfo().TotalPhysicalMemory;//как-то по-другому можт, без VisualBasic....
+            
+            partSize =  Environment.SystemPageSize/(maxTasksCount*2); 
         }
 
         public static void Compress(string source, string destination)
@@ -60,7 +65,7 @@ namespace Compressor
             //проверки наличия файла?
             using (FileStream sourceFile = new FileStream(source, FileMode.Open))
             {
-                //содздаем и запускаем потоки для сжатия
+                //создаем и запускаем потоки для сжатия
                 for (int i = 0; i < maxTasksCount; i++)
                 {
                     threadPull[i] = new Thread(consumerProcess);
@@ -77,17 +82,14 @@ namespace Compressor
                 int partNumb = 0;
                 while (sourceFile.Read(buffer, 0, partSize) != 0)
                 {
-                    if (allTasks.Count == maxTasksCount)
-                    {
+                    if (allTasks.Count == maxTasksCount)//если очередь заданий полна
                         needNewTask.WaitOne();
-                        needNewTask.Reset();
-                    }
 
+                    Task newTask = new Task();
+                    newTask.buffer = buffer;
+                    newTask.numberOfPart = partNumb++;
                     lock (allTasksLock)
                     {
-                        Task newTask = new Task();
-                        newTask.buffer = buffer;
-                        newTask.numberOfPart = partNumb++;
                         allTasks.Enqueue(newTask);
                         newTaskAdded.Set();
                     }
@@ -108,6 +110,7 @@ namespace Compressor
         {
             while (true)
             {
+                Console.WriteLine(Thread.CurrentThread.Name + " заход в цикл");
                 //проверяем, не пора ли заканчивать этот разврат
                 //проверяем переменную конца  в локе
                 bool end = false;
@@ -129,7 +132,17 @@ namespace Compressor
                 {          
                     // ждем события добавления нового задания
                     newTaskAdded.WaitOne();
-                    newTaskAdded.Reset();
+                    //проснулись, посчитали себя в счетчике и посмотрели, не нужно ли перезагрузить событие
+                    lock (newTaskAddedCounterLocker)
+                    {
+                        newTaskAddedCounter++;
+                        if (newTaskAddedCounter == maxTasksCount)
+                        {
+                            newTaskAdded.Reset();
+                            newTaskAddedCounter = 0;
+                        }
+                    }
+                    
                 }
 
                 Task task = null;
@@ -142,6 +155,7 @@ namespace Compressor
                     }
                 }
 
+                //выполнение основной задачи
                 if (task != null)
                 {
                     Task doneTask = new Task();
@@ -154,7 +168,7 @@ namespace Compressor
                         }
                         doneTask.buffer = output.ToArray();
                     }
-
+                    //запись готового задания в список готовых
                     lock (doneTasksLock)
                     {
                         doneTasks.Add(doneTask);
