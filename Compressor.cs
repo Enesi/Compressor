@@ -10,22 +10,16 @@ using Microsoft;
 
 namespace Compressor
 {
-    public class Task 
-    {
-        public byte[] buffer;
-        public int numberOfPart;
-    }
-
     public static class Compressor
     {
         static Thread[] threadPull;
         static int partSize;
         static int maxTasksCount;
 
-        static Queue<Task> allTasks; //или использовать потокобезопасную  ConcurrentQueue ?... 
-        static object allTasksLock = new object();
+        static Queue<Task> allTasks;
+        static object allTasksLock;
         static ManualResetEvent newTaskAdded; //если реализовывать специальную очередь, то событие будет в ее полномочиях
-        static int newTaskAddedCounter=0;
+        static int newTaskAddedCounter=1;
         static object newTaskAddedCounterLocker= new object();
         static AutoResetEvent needNewTask;
 
@@ -53,10 +47,11 @@ namespace Compressor
         static void calculateSize()
         {
             //???? 
-            maxTasksCount = Environment.ProcessorCount;
+            maxTasksCount = Environment.ProcessorCount*2;
             //ulong memory = Microsoft.VisualBasic.Devices.ComputerInfo().TotalPhysicalMemory;//как-то по-другому можт, без VisualBasic....
             
-            partSize =  Environment.SystemPageSize/(maxTasksCount*2); 
+            partSize =  100000000; 
+            //          250000000
         }
 
         public static void Compress(string source, string destination)
@@ -82,8 +77,11 @@ namespace Compressor
                 int partNumb = 0;
                 while (sourceFile.Read(buffer, 0, partSize) != 0)
                 {
-                    if (allTasks.Count == maxTasksCount)//если очередь заданий полна
+                    Console.WriteLine("Readed " + partNumb + " of " + sourceFile.Length / partSize + ". Count of tasks: " + allTasks.Count);
+                    if (allTasks.Count == maxTasksCount - 1)//если очередь заданий полна
+                    {
                         needNewTask.WaitOne();
+                    }
 
                     Task newTask = new Task();
                     newTask.buffer = buffer;
@@ -92,12 +90,14 @@ namespace Compressor
                     {
                         allTasks.Enqueue(newTask);
                         newTaskAdded.Set();
+                        //newTaskAddedCounter = 1;
                     }
                 }
                 lock (endOfFileLock)
                 {
                     endOfFile = true;
                 }
+                newTaskAddedCounter = 4;
                 newTaskAdded.Set();// =( эт на случай если рабочийПоток успел войти в ожидание после того, как проверил endOfFile, но до того, как здесь его изменили
             }
             foreach (var t in threadPull)
@@ -154,17 +154,19 @@ namespace Compressor
                         needNewTask.Set();
                     }
                 }
-
+                Console.WriteLine(Thread.CurrentThread.Name + "сейчас будем сжимать");
                 //выполнение основной задачи
                 if (task != null)
                 {
                     Task doneTask = new Task();
                     doneTask.numberOfPart = task.numberOfPart;
+                    
                     using (MemoryStream output = new MemoryStream(partSize))
                     {
-                        using (GZipStream gzip = new GZipStream(output, CompressionMode.Compress))
+                        using (GZipStream gzip = new GZipStream(output, CompressionLevel.Optimal))
                         {
                             gzip.Write(task.buffer, 0, partSize);
+                            Console.WriteLine(Thread.CurrentThread.Name + "after gzip.write");
                         }
                         doneTask.buffer = output.ToArray();
                     }
@@ -173,8 +175,9 @@ namespace Compressor
                     {
                         doneTasks.Add(doneTask);
                         newDoneTaskAdded.Set();
-                    }
+                    }                   
                 }
+                Console.WriteLine(Thread.CurrentThread.Name + "конец цикла");
             }
 
         }
